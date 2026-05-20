@@ -604,7 +604,7 @@ void draw_graph(SDL_Renderer *r, AppData *d, const Interface &iface) {
   draw_rect(r, bounds, C_BORDER);
 
   draw_text(r, d->font_sm,
-            "Network Throughput  \xE2\x80\x94  " + iface.name,
+            "Network Throughput - " + iface.name,
             bounds.x + 14, bounds.y + 10, C_TEXT);
 
   const int pad_t = 32, pad_b = 22, pad_l = 70, pad_r = 14;
