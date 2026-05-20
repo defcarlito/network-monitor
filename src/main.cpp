@@ -75,6 +75,7 @@ typedef struct Button {
 
 typedef struct AppData {
   TTF_Font *font_lg, *font_md, *font_sm, *font_xs;
+  SDL_Texture *tex_wifi, *tex_arrow_green, *tex_arrow_red;
   std::vector<Interface> interfaces;
   int selected_idx;
   int scroll_offset;
@@ -110,6 +111,43 @@ TTF_Font *load_font(int size) {
   }
   std::fprintf(stderr, "[Font] no font found for size %d\n", size);
   return NULL;
+}
+
+// Recolors a monochrome icon to `tint`.  Visibility comes from how dark and
+// how opaque each source pixel is, so this works whether the icon sits on a
+// white background or a transparent one.
+SDL_Texture *load_icon_tinted(SDL_Renderer *r, const char *path, SDL_Color tint) {
+  SDL_Surface *raw = IMG_Load(path);
+  if (!raw) {
+    std::fprintf(stderr, "[IMG] failed to load %s: %s\n", path, IMG_GetError());
+    return NULL;
+  }
+  SDL_Surface *surf = SDL_ConvertSurfaceFormat(raw, SDL_PIXELFORMAT_RGBA32, 0);
+  SDL_FreeSurface(raw);
+  if (!surf) return NULL;
+  SDL_LockSurface(surf);
+  Uint32 *px = (Uint32 *)surf->pixels;
+  int count = (surf->pitch / 4) * surf->h;
+  for (int i = 0; i < count; i++) {
+    Uint8 cr, cg, cb, ca;
+    SDL_GetRGBA(px[i], surf->format, &cr, &cg, &cb, &ca);
+    int brightness = (cr + cg + cb) / 3;
+    // Combine darkness with the source alpha: transparent or white pixels
+    // fade out, dark opaque pixels stay fully tinted.
+    Uint8 alpha = (Uint8)(ca * (255 - brightness) / 255);
+    px[i] = SDL_MapRGBA(surf->format, tint.r, tint.g, tint.b, alpha);
+  }
+  SDL_UnlockSurface(surf);
+  SDL_Texture *tex = SDL_CreateTextureFromSurface(r, surf);
+  SDL_FreeSurface(surf);
+  if (tex) SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
+  return tex;
+}
+
+void load_images(SDL_Renderer *r, AppData *d) {
+  d->tex_wifi        = load_icon_tinted(r, "img/wifi.png",  C_ACCENT);
+  d->tex_arrow_green = load_icon_tinted(r, "img/arrow.png", C_SUCCESS);
+  d->tex_arrow_red   = load_icon_tinted(r, "img/arrow.png", C_DANGER);
 }
 
 std::string fmt_bytes(uint64_t b) {
@@ -381,12 +419,16 @@ void draw_header(SDL_Renderer *r, AppData *d) {
   set_color(r, C_BORDER);
   SDL_RenderDrawLine(r, 0, HEADER_H - 1, WIDTH, HEADER_H - 1);
 
-  SDL_Rect icon = {14, (HEADER_H - 28) / 2, 28, 28};
-  fill_rounded(r, icon, 6, C_ACCENT);
-  SDL_Rect inner = {icon.x + 6, icon.y + 6, icon.w - 12, icon.h - 12};
-  fill_rounded(r, inner, 3, C_BG);
+  SDL_Rect icon = {14, (HEADER_H - 40) / 2, 40, 40};
+  if (d->tex_wifi) {
+    SDL_RenderCopy(r, d->tex_wifi, NULL, &icon);
+  } else {
+    fill_rounded(r, icon, 6, C_ACCENT);
+    SDL_Rect inner = {icon.x + 6, icon.y + 6, icon.w - 12, icon.h - 12};
+    fill_rounded(r, inner, 3, C_BG);
+  }
 
-  draw_text(r, d->font_md, "Network Monitor", 54, 10, C_TEXT);
+  draw_text(r, d->font_md, "Network Monitor", 64, 10, C_TEXT);
   std::string sub = "source: ";
 #ifdef __APPLE__
   sub += "macOS getifaddrs (AF_LINK / if_data)";
@@ -396,7 +438,7 @@ void draw_header(SDL_Renderer *r, AppData *d) {
   if (d->paused) sub += "   \xE2\x80\xA2   PAUSED";
   uint32_t elapsed = (SDL_GetTicks() - d->session_start_ms) / 1000;
   sub += "   \xE2\x80\xA2   session " + fmt_duration(elapsed);
-  draw_text(r, d->font_xs, sub, 54, 36, C_MUTED);
+  draw_text(r, d->font_xs, sub, 64, 36, C_MUTED);
 
   draw_button(r, d->font_sm, d->btn_sort);
   draw_button(r, d->font_sm, d->btn_reset);
@@ -431,9 +473,28 @@ void draw_sidebar(SDL_Renderer *r, AppData *d, const std::vector<int> &idx) {
       fill_rect(r, bar, C_ACCENT);
     }
     draw_text(r, d->font_sm, iface.name, row.x + 14, row.y + 6, C_TEXT);
-    std::string sub = std::string("\xE2\x86\x93 ") + fmt_rate(iface.current.rx_bps) +
-                      "   \xE2\x86\x91 " + fmt_rate(iface.current.tx_bps);
-    draw_text(r, d->font_xs, sub, row.x + 14, row.y + 28, C_MUTED);
+
+    const int ico = 12;
+    int sub_y = row.y + 30;
+    int icon_y = sub_y + 1;
+    std::string rx_str = fmt_rate(iface.current.rx_bps);
+    std::string tx_str = fmt_rate(iface.current.tx_bps);
+
+    // RX (download) → red arrow rotated 180° to point DOWN.
+    SDL_Rect rx_icon = {row.x + 14, icon_y, ico, ico};
+    if (d->tex_arrow_red) {
+      SDL_RenderCopyEx(r, d->tex_arrow_red, NULL, &rx_icon, 180, NULL, SDL_FLIP_NONE);
+    }
+    draw_text(r, d->font_xs, rx_str, rx_icon.x + ico + 4, sub_y, C_MUTED);
+
+    SDL_Point rx_w = measure(d->font_xs, rx_str);
+    int tx_x = rx_icon.x + ico + 4 + rx_w.x + 10;
+    // TX (upload) → green arrow, no rotation (PNG already points up).
+    SDL_Rect tx_icon = {tx_x, icon_y, ico, ico};
+    if (d->tex_arrow_green) {
+      SDL_RenderCopy(r, d->tex_arrow_green, NULL, &tx_icon);
+    }
+    draw_text(r, d->font_xs, tx_str, tx_x + ico + 4, sub_y, C_MUTED);
   }
 
   SDL_RenderSetClipRect(r, NULL);
@@ -452,7 +513,8 @@ void draw_sidebar(SDL_Renderer *r, AppData *d, const std::vector<int> &idx) {
 
 void draw_stat_card(SDL_Renderer *r, AppData *d, SDL_Rect rect,
                     const std::string &title, const std::string &value,
-                    const std::string &sub, SDL_Color accent) {
+                    const std::string &sub, SDL_Color accent,
+                    SDL_Texture *icon, double icon_angle) {
   fill_rounded(r, rect, 8, C_PANEL);
   draw_rect(r, rect, C_BORDER);
   SDL_Rect stripe = {rect.x, rect.y + 12, 3, rect.h - 24};
@@ -460,6 +522,11 @@ void draw_stat_card(SDL_Renderer *r, AppData *d, SDL_Rect rect,
   draw_text(r, d->font_xs, title, rect.x + 16, rect.y + 12, C_MUTED);
   draw_text(r, d->font_lg, value, rect.x + 16, rect.y + 30, C_TEXT);
   if (!sub.empty()) draw_text(r, d->font_xs, sub, rect.x + 16, rect.y + rect.h - 22, C_DIM);
+  if (icon) {
+    const int sz = 32;
+    SDL_Rect ir = {rect.x + rect.w - sz - 12, rect.y + (rect.h - sz) / 2, sz, sz};
+    SDL_RenderCopyEx(r, icon, NULL, &ir, icon_angle, NULL, SDL_FLIP_NONE);
+  }
 }
 
 void draw_cards(SDL_Renderer *r, AppData *d, const Interface &iface) {
@@ -482,16 +549,20 @@ void draw_cards(SDL_Renderer *r, AppData *d, const Interface &iface) {
 
   draw_stat_card(r, d, card_dl, "DOWNLOAD",
                  fmt_rate(iface.current.rx_bps),
-                 "peak " + fmt_rate(iface.peak_rx), C_ACCENT);
+                 "peak " + fmt_rate(iface.peak_rx), C_ACCENT,
+                 d->tex_arrow_red, 180.0);
   draw_stat_card(r, d, card_ul, "UPLOAD",
                  fmt_rate(iface.current.tx_bps),
-                 "peak " + fmt_rate(iface.peak_tx), C_ACCENT2);
+                 "peak " + fmt_rate(iface.peak_tx), C_ACCENT2,
+                 d->tex_arrow_green, 0.0);
   draw_stat_card(r, d, card_rx, "SESSION RX",
                  fmt_bytes(rx_total),
-                 "lifetime " + fmt_bytes(iface.rx_bytes), C_SUCCESS);
+                 "lifetime " + fmt_bytes(iface.rx_bytes), C_SUCCESS,
+                 NULL, 0.0);
   draw_stat_card(r, d, card_tx, "SESSION TX",
                  fmt_bytes(tx_total),
-                 "lifetime " + fmt_bytes(iface.tx_bytes), C_WARNING);
+                 "lifetime " + fmt_bytes(iface.tx_bytes), C_WARNING,
+                 NULL, 0.0);
 
   const int bot_y = cy + ch - bot_h;
   const int bot_col_w = (cw - gap) / 2;
@@ -619,6 +690,9 @@ void initialize(AppData *d) {
   d->font_md = load_font(18);
   d->font_sm = load_font(13);
   d->font_xs = load_font(11);
+  d->tex_wifi = NULL;
+  d->tex_arrow_green = NULL;
+  d->tex_arrow_red = NULL;
   d->selected_idx = -1;
   d->scroll_offset = 0;
   d->sort_mode = 0;
@@ -661,6 +735,9 @@ void cleanup(AppData *d) {
   if (d->font_md) TTF_CloseFont(d->font_md);
   if (d->font_sm) TTF_CloseFont(d->font_sm);
   if (d->font_xs) TTF_CloseFont(d->font_xs);
+  if (d->tex_wifi)        SDL_DestroyTexture(d->tex_wifi);
+  if (d->tex_arrow_green) SDL_DestroyTexture(d->tex_arrow_green);
+  if (d->tex_arrow_red)   SDL_DestroyTexture(d->tex_arrow_red);
 }
 
 int main(int, char *[]) {
@@ -677,6 +754,7 @@ int main(int, char *[]) {
 
   AppData data;
   initialize(&data);
+  load_images(renderer, &data);
   data.session_start_ms = SDL_GetTicks();
   data.last_sample_ms = SDL_GetTicks();
   sample(&data);
